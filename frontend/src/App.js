@@ -1,23 +1,17 @@
-import logo from './logo.svg';
-import './App.css';
+import React from "react";
+import CostEstimator from "./components/CostEstimator";
+import IaCGenerator from "./components/IaCGenerator";
+import InstanceRecommender from "./components/InstanceRecommender";
 
 function App() {
   return (
     <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
+      <h1>AWS Cloud Migration Tool</h1>
+      <CostEstimator />
+      <hr />
+      <InstanceRecommender />
+      <hr />
+      <IaCGenerator />
     </div>
   );
 }

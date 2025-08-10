@@ -2,3 +2,11 @@ scikit-learn
 pandas
 numpy
 flask
+joblib
+numpy
+flask-cors
+gunicorn
+requests
+flask-restful
+flask-sqlalchemy
+flask-migrate

@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Iterable, Optional
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 import numpy as np
 import joblib
@@ -16,14 +17,15 @@ CORS(app)
 # =========================
 # Config (env-overridable)
 # =========================
-TARGET_REGION_CODE      = os.getenv("TARGET_REGION_CODE", "us-east-1")         # Region you want to recommend for
-PRICING_ENDPOINT_REGION = os.getenv("PRICING_ENDPOINT_REGION", "ap-south-1")   # Pricing API endpoint (ap-south-1 or us-east-1)
+TARGET_REGION_CODE      = os.getenv("TARGET_REGION_CODE", "us-east-1")         # Region to recommend/price
+PRICING_ENDPOINT_REGION = os.getenv("PRICING_ENDPOINT_REGION", "us-east-1")    # Pricing API endpoint region: us-east-1 or ap-south-1
 INSTANCE_FAMILY_FILTERS = [s.strip().lower() for s in os.getenv("INSTANCE_FAMILY_FILTERS", "").split(",") if s.strip()]  # e.g. "t" or "t,m"
-MAX_CANDIDATES          = int(os.getenv("MAX_CANDIDATES", "20"))               # shortlist to price
+MAX_CANDIDATES          = int(os.getenv("MAX_CANDIDATES", "20"))               # shortlist to price for /optimize
 AWS_PROFILE_NAME        = os.getenv("AWS_PROFILE") or os.getenv("CLOUD_MIGRATION_AWS_PROFILE")
-CACHE_TTL               = int(os.getenv("CACHE_TTL", str(24*60*60)))           # 24h
+CACHE_TTL               = int(os.getenv("CACHE_TTL", str(24*60*60)))           # 24h for offerings/specs
+PRICE_CACHE_TTL         = int(os.getenv("PRICE_CACHE_TTL", str(24*60*60)))     # 24h for per-type price
 
-# regionCode -> human location (same region; not cross-region)
+# regionCode -> human location
 REGION_TO_LOCATION = {
     "us-east-1": "US East (N. Virginia)",
     "us-east-2": "US East (Ohio)",
@@ -55,10 +57,19 @@ def _session():
     return boto3.session.Session()
 
 def ec2_client(region_code: str):
-    return _session().client("ec2", region_name=region_code, config=Config(retries={"max_attempts": 10, "mode": "standard"}))
+    return _session().client(
+        "ec2",
+        region_name=region_code,
+        config=Config(retries={"max_attempts": 10, "mode": "standard"})
+    )
 
 def pricing_client():
-    return _session().client("pricing", region_name=PRICING_ENDPOINT_REGION, config=Config(retries={"max_attempts": 10, "mode": "standard"}))
+    # Pricing endpoint is only in certain regions (use us-east-1 or ap-south-1)
+    return _session().client(
+        "pricing",
+        region_name=PRICING_ENDPOINT_REGION,
+        config=Config(retries={"max_attempts": 10, "mode": "standard"})
+    )
 
 # =========================
 # Helpers
@@ -77,10 +88,10 @@ def _matches_families(instance_type: str) -> bool:
     return any(t.startswith(prefix) for prefix in INSTANCE_FAMILY_FILTERS)
 
 # =========================
-# EC2: What’s actually offered in region
+# EC2 offerings/specs
 # =========================
 def list_offered_instance_types(region_code: str) -> List[str]:
-    """DescribeInstanceTypeOfferings → all instance types launchable in this region."""
+    """All instance types launchable in this region."""
     cli = ec2_client(region_code)
     types: List[str] = []
     paginator = cli.get_paginator("describe_instance_type_offerings")
@@ -91,14 +102,8 @@ def list_offered_instance_types(region_code: str) -> List[str]:
                 types.append(itype)
     return sorted(list(set(types)))
 
-# =========================
-# EC2: Specs (vCPU & MiB) for those types
-# =========================
 def describe_instance_specs(region_code: str, instance_types: List[str]) -> List[Dict[str, Any]]:
-    """
-    DescribeInstanceTypes with an explicit list (<=100 per call).
-    NOTE: Do NOT pass MaxResults/NextToken with InstanceTypes (invalid combo).
-    """
+    """vCPU & memory for instance types (batch up to 100, IMPORTANT: no MaxResults when passing InstanceTypes)."""
     cli = ec2_client(region_code)
     out: List[Dict[str, Any]] = []
     for batch in _chunked(instance_types, 100):
@@ -113,10 +118,12 @@ def describe_instance_specs(region_code: str, instance_types: List[str]) -> List
     return out
 
 # =========================
-# Pricing helpers
+# Pricing helpers + cache
 # =========================
+_price_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}  # {region: {itype: {"price":float|None, "ts":epoch}}}
+
 def _extract_price_from_products(price_list: List[str]) -> Optional[float]:
-    """Parse PriceList array of JSON strings to find On-Demand USD / Hrs price (min across dims)."""
+    """Find the minimum On-Demand USD/Hrs in a PriceList page."""
     best = None
     for product_json in price_list:
         try:
@@ -136,7 +143,7 @@ def _extract_price_from_products(price_list: List[str]) -> Optional[float]:
                         continue
                     if dim.get("unit") != "Hrs":
                         continue
-                    usd = dim.get("pricePerUnit", {}).get("USD")
+                    usd = (dim.get("pricePerUnit") or {}).get("USD")
                     if not usd:
                         continue
                     try:
@@ -146,101 +153,105 @@ def _extract_price_from_products(price_list: List[str]) -> Optional[float]:
                         pass
     return best
 
+def _best_price_via_filters(cli, filters: List[Dict[str, str]]) -> Optional[float]:
+    """Iterate all pages and return the lowest On-Demand $/hr."""
+    try:
+        paginator = cli.get_paginator("get_products")
+        best = None
+        for page in paginator.paginate(ServiceCode="AmazonEC2", Filters=filters, FormatVersion="aws_v1"):
+            v = _extract_price_from_products(page.get("PriceList", []))
+            if v is not None:
+                best = v if (best is None or v < best) else best
+        return best
+    except ClientError as e:
+        print("Pricing get_products failed:", e)
+        return None
+
 def price_instance_type_usd_per_hr(itype: str, region_code: str) -> Optional[float]:
     """
-    Price one instanceType with reliable, single-region filters.
-    Try LOCATION first, then REGIONCODE, then add capacitystatus as last fallback.
+    Minimal, robust filters + pagination:
+      1) instanceType + operatingSystem + location
+      2) instanceType + operatingSystem + regionCode (fallback)
+      3/4) add capacitystatus=Used if both returned nothing
     """
+    # cache check
+    region_cache = _price_cache.setdefault(region_code, {})
+    entry = region_cache.get(itype)
+    now = time.time()
+    if entry and (now - entry["ts"]) < PRICE_CACHE_TTL:
+        return entry["price"]
+
     cli = pricing_client()
     location = REGION_TO_LOCATION.get(region_code)
 
-    # Common filters (no capacitystatus initially; it can drop rows for some catalogs)
-    common = [
-        {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
-        {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
-        {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+    common_min = [
         {"Type": "TERM_MATCH", "Field": "instanceType", "Value": itype},
+        {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
     ]
 
-    # 1) LOCATION (most reliable)
-    if location:
-        f1 = common + [{"Type": "TERM_MATCH", "Field": "location", "Value": location}]
-        resp = cli.get_products(ServiceCode="AmazonEC2", Filters=f1, FormatVersion="aws_v1", MaxResults=100)
-        price = _extract_price_from_products(resp.get("PriceList", []))
-        if price is not None:
-            return price
+    price = None
 
-    # 2) REGIONCODE
-    f2 = common + [{"Type": "TERM_MATCH", "Field": "regionCode", "Value": region_code}]
-    resp = cli.get_products(ServiceCode="AmazonEC2", Filters=f2, FormatVersion="aws_v1", MaxResults=100)
-    price = _extract_price_from_products(resp.get("PriceList", []))
-    if price is not None:
-        return price
-
-    # 3) LOCATION + capacitystatus=Used (last fallback)
     if location:
+        f1 = common_min + [{"Type": "TERM_MATCH", "Field": "location", "Value": location}]
+        price = _best_price_via_filters(cli, f1)
+
+    if price is None:
+        f2 = common_min + [{"Type": "TERM_MATCH", "Field": "regionCode", "Value": region_code}]
+        price = _best_price_via_filters(cli, f2)
+
+    if price is None and location:
         f3 = f1 + [{"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"}]
-        resp = cli.get_products(ServiceCode="AmazonEC2", Filters=f3, FormatVersion="aws_v1", MaxResults=100)
-        price = _extract_price_from_products(resp.get("PriceList", []))
-        if price is not None:
-            return price
+        price = _best_price_via_filters(cli, f3)
 
-    # 4) REGIONCODE + capacitystatus=Used (last fallback)
-    f4 = f2 + [{"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"}]
-    resp = cli.get_products(ServiceCode="AmazonEC2", Filters=f4, FormatVersion="aws_v1", MaxResults=100)
-    price = _extract_price_from_products(resp.get("PriceList", []))
-    if price is not None:
-        return price
+    if price is None:
+        f4 = f2 + [{"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"}]
+        price = _best_price_via_filters(cli, f4)
 
-    return None
+    # cache write
+    region_cache[itype] = {"price": price, "ts": now}
+    return price
+
+def prices_for_types(instance_types: List[str], region_code: str) -> List[Dict[str, Any]]:
+    """[{instance_type, price_per_hour}] for given names (order preserved)."""
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for it in instance_types:
+        if not it or not isinstance(it, str):
+            continue
+        if it in seen:
+            continue
+        seen.add(it)
+        price = price_instance_type_usd_per_hr(it, region_code)
+        out.append({"instance_type": it, "price_per_hour": price})
+    return out
 
 # =========================
-# Cache for offerings/specs (per region)
+# Cache for offerings/specs list (used by /debug/eligibles and /optimize)
 # =========================
 _pricing_cache: Dict[str, Any] = {"ts": 0, "region": None, "rows": None}
 
-def _get_pricing_rows(region_code: str, req_cpu: int, req_ram_gb: float) -> List[Dict[str, Any]]:
-    """
-    Build shortlist:
-      1) offerings (launchable types)
-      2) specs (vcpu/mem) -> keep >= requested
-      3) sort by (vCPU asc, mem asc), then price top N
-    Return list of {instance_type, vCPU, memory_GB, price_per_hour}
-    """
+def _ensure_specs_cache(region_code: str):
+    """Warm or reuse the offerings/specs cache."""
     global _pricing_cache
     now = time.time()
-    have_cache = (
+    if (
         _pricing_cache["rows"] is not None
         and _pricing_cache["region"] == region_code
         and (now - _pricing_cache["ts"]) < CACHE_TTL
-    )
+    ):
+        return
+    offered = list_offered_instance_types(region_code)
+    if not offered:
+        raise RuntimeError(f"No EC2 instance type offerings in {region_code}")
+    specs = describe_instance_specs(region_code, offered)
+    _pricing_cache["rows"] = specs
+    _pricing_cache["region"] = region_code
+    _pricing_cache["ts"] = now
 
-    if not have_cache:
-        offered = list_offered_instance_types(region_code)
-        if not offered:
-            raise RuntimeError(f"No EC2 instance type offerings in {region_code}")
-        specs = describe_instance_specs(region_code, offered)
-        _pricing_cache["rows"] = specs          # cache unfiltered specs for TTL
-        _pricing_cache["region"] = region_code
-        _pricing_cache["ts"] = now
-    else:
-        specs = _pricing_cache["rows"]
-
-    eligible = [r for r in specs if r["vCPU"] >= req_cpu and r["memory_GB"] >= req_ram_gb]
-    if not eligible:
-        return []
-
-    eligible.sort(key=lambda r: (r["vCPU"], r["memory_GB"]))  # smallest that fits
-    shortlist = eligible[:max(1, MAX_CANDIDATES)]
-
-    results = []
-    for row in shortlist:
-        p = price_instance_type_usd_per_hr(row["instance_type"], region_code)
-        if p is None:
-            continue
-        results.append({**row, "price_per_hour": p})
-
-    return results
+def _eligible_specs(req_cpu: int, req_ram_gb: float) -> List[Dict[str, Any]]:
+    rows = [r for r in _pricing_cache["rows"] if r["vCPU"] >= req_cpu and r["memory_GB"] >= req_ram_gb]
+    rows.sort(key=lambda r: (r["vCPU"], r["memory_GB"]))
+    return rows
 
 # =========================
 # Routes
@@ -253,31 +264,77 @@ def home():
 def health():
     return jsonify({"ok": True})
 
-# quick debug to see eligibles (no prices)
+# FAST: eligibles (no prices) for your table base
 @app.route("/debug/eligibles")
 def debug_eligibles():
     try:
         req_cpu = int(request.args.get("cpu", "1"))
         req_ram = float(request.args.get("ram", "1"))
-        # ensure cache built
-        _ = _get_pricing_rows(TARGET_REGION_CODE, 1, 0.5)  # warm if needed
-        # pull from cache directly to list eligibles
-        rows = [r for r in _pricing_cache["rows"] if r["vCPU"] >= req_cpu and r["memory_GB"] >= req_ram]
-        rows.sort(key=lambda r: (r["vCPU"], r["memory_GB"]))
+        _ensure_specs_cache(TARGET_REGION_CODE)
+        rows = _eligible_specs(req_cpu, req_ram)
         return jsonify({"region": TARGET_REGION_CODE, "eligible_count": len(rows), "first_20": rows[:20]})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# NEW: price by instance names (POST) — UI uses this to fill the price column
+@app.route("/price_instances", methods=["POST"])
+def price_instances():
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        types = body.get("instance_types", [])
+        if not isinstance(types, list) or not types:
+            return jsonify({"error": "Provide JSON {\"instance_types\": [\"t3.micro\", ...]}"}), 400
+        region_code = request.args.get("region", TARGET_REGION_CODE)
+        priced = prices_for_types(types, region_code)
+        return jsonify({"region": region_code, "count": len(priced), "rows": priced})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# Debug helper: check raw counts/prices for one type
+@app.route("/debug/pricing_raw")
+def debug_pricing_raw():
+    itype = request.args.get("type")
+    region_code = request.args.get("region", TARGET_REGION_CODE)
+    if not itype:
+        return jsonify({"error": "Add ?type=t3.micro"}), 400
+
+    cli = pricing_client()
+    location = REGION_TO_LOCATION.get(region_code)
+
+    def count(filters):
+        total = 0
+        paginator = cli.get_paginator("get_products")
+        for page in paginator.paginate(ServiceCode="AmazonEC2", Filters=filters, FormatVersion="aws_v1"):
+            total += len(page.get("PriceList", []))
+        return total
+
+    common_min = [
+        {"Type": "TERM_MATCH", "Field": "instanceType", "Value": itype},
+        {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
+    ]
+
+    results = {}
+    if location:
+        f1 = common_min + [{"Type": "TERM_MATCH", "Field": "location", "Value": location}]
+        results["location_count"] = count(f1)
+        results["location_price"] = _best_price_via_filters(cli, f1)
+
+    f2 = common_min + [{"Type": "TERM_MATCH", "Field": "regionCode", "Value": region_code}]
+    results["regionCode_count"] = count(f2)
+    results["regionCode_price"] = _best_price_via_filters(cli, f2)
+
+    return jsonify({"region": region_code, "type": itype, **results})
+
+# ML estimate (unchanged)
 @app.route("/predict", methods=["POST"])
 def predict():
     if not model:
         return jsonify({"error": "Model not loaded"}), 500
-
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({"error": "Invalid or missing JSON body"}), 400
-
     try:
         features = np.array([
             data["cpu_cores"],
@@ -290,47 +347,33 @@ def predict():
         return jsonify({"error": f"Missing input field: {str(e)}"}), 400
     except Exception as e:
         return jsonify({"error": f"Invalid input data: {str(e)}"}), 400
-
     try:
         prediction = float(model.predict(features)[0])
     except Exception as e:
         return jsonify({"error": f"Model prediction failed: {str(e)}"}), 500
-
     return jsonify({"estimated_cost": round(prediction, 2)})
 
+# Single best pick (kept)
 @app.route("/optimize", methods=["POST"])
 def optimize():
     try:
         data = request.get_json(force=True, silent=True)
         if not data:
             return jsonify({"error": "Invalid or missing JSON body"}), 400
-
-        try:
-            req_cpu = int(data.get("cpu_cores", 1))
-            req_ram = float(data.get("ram_gb", 1))
-        except Exception as e:
-            return jsonify({"error": f"Invalid cpu_cores or ram_gb: {str(e)}"}), 400
-
-        try:
-            priced = _get_pricing_rows(TARGET_REGION_CODE, req_cpu, req_ram)
-        except Exception as e:
-            traceback.print_exc()
-            return jsonify({"error": "Failed to build pricing shortlist", "details": str(e), "type": e.__class__.__name__}), 500
-
+        req_cpu = int(data.get("cpu_cores", 1))
+        req_ram = float(data.get("ram_gb", 1))
+        _ensure_specs_cache(TARGET_REGION_CODE)
+        # shortlist from smallest that fits, then price those
+        rows = _eligible_specs(req_cpu, req_ram)[:max(1, MAX_CANDIDATES)]
+        priced = []
+        for r in rows:
+            p = price_instance_type_usd_per_hr(r["instance_type"], TARGET_REGION_CODE)
+            if p is not None:
+                priced.append({**r, "price_per_hour": p})
         if not priced:
-            # help message: show a couple eligibles from debug endpoint idea
-            # (don’t price here—just hint what was eligible)
-            try:
-                rows = [r for r in _pricing_cache["rows"] if r["vCPU"] >= req_cpu and r["memory_GB"] >= req_ram]
-                rows.sort(key=lambda r: (r["vCPU"], r["memory_GB"]))
-                sample = rows[:5]
-            except Exception:
-                sample = []
-            return jsonify({"error": "No instances meet the requirements in this region", "eligible_sample": sample}), 404
-
+            return jsonify({"error": "No instances meet the requirements in this region"}), 404
         best = min(priced, key=lambda r: r["price_per_hour"])
         return jsonify(best)
-
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": "Unhandled server error", "details": str(e), "type": e.__class__.__name__}), 500
@@ -344,16 +387,18 @@ def generate_iac():
 # Startup
 # =========================
 if __name__ == "__main__":
-    # Pre-warm offerings/specs cache (pricing happens per shortlist later)
     try:
         print("Warming EC2 offerings/specs cache...")
-        _ = _get_pricing_rows(TARGET_REGION_CODE, 1, 0.5)
-        print("Cache warm complete.")
+        offered = list_offered_instance_types(TARGET_REGION_CODE)
+        _pricing_cache["rows"] = describe_instance_specs(TARGET_REGION_CODE, offered)
+        _pricing_cache["region"] = TARGET_REGION_CODE
+        _pricing_cache["ts"] = time.time()
+        print("Cache warm complete. Types cached:", len(_pricing_cache["rows"]))
     except Exception as e:
         print("Warm-up skipped:", e)
 
-    # Make sure creds are visible:
-    #   export AWS_PROFILE=cloud-migration-tool
-    # Optional: narrow families for speed:
+    # Optional speed-up:
     #   export INSTANCE_FAMILY_FILTERS="t"
+    # Pricing endpoint example (recommended):
+    #   export PRICING_ENDPOINT_REGION=us-east-1
     app.run(host="0.0.0.0", port=5000, debug=True)

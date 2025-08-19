@@ -1,3 +1,4 @@
+import './index.css';
 import React from "react";
 import CostEstimator from "./components/CostEstimator";
 import IaCGenerator from "./components/IaCGenerator";

@@ -7,7 +7,6 @@ import InstanceRecommender from "./components/InstanceRecommender";
 function App() {
   return (
     <div className="App">
-      <h1>AWS Cloud Migration Tool</h1>
       <CostEstimator />
       <hr />
       <InstanceRecommender />

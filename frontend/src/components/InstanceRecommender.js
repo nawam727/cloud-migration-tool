@@ -198,8 +198,6 @@ export default function InstanceRecommenderUI() {
                   </div>
                 )}
 
-                {!instance && !loading && <div className="text-slate-500">No single recommendation yet.</div>}
-
                 {/* Eligible instances table */}
                 {eligibles.length > 0 && (
                   <div className="overflow-x-auto">

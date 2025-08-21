@@ -47,7 +47,7 @@ export default function CostEstimator() {
     ram_gb: 4,
     storage_gb: 100,
     transfer_gb: 50,
-    labor_hours: 10,
+    labor_hours: 5,
   });
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);

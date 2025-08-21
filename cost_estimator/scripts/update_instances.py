@@ -4,7 +4,6 @@ import time
 import json
 import traceback
 from typing import List, Dict, Any, Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -63,7 +62,7 @@ def _matches_families(instance_type: str) -> bool:
     t = instance_type.lower()
     return any(t.startswith(prefix) for prefix in INSTANCE_FAMILY_FILTERS)
 
-_pricing_cache: Dict[str, Any] = {"ts": 0, "region": None, "rows": None}
+_specs_cache: Dict[str, Any] = {"ts": 0, "region": None, "rows": None}
 
 def list_offered_instance_types(region_code: str) -> List[str]:
     cli = ec2_client(region_code)
@@ -97,27 +96,24 @@ def describe_instance_specs(
     return out
 
 def _ensure_specs_cache(region_code: str):
-    global _pricing_cache
     now = time.time()
     if (
-        _pricing_cache["rows"] is not None
-        and _pricing_cache["region"] == region_code
-        and (now - _pricing_cache["ts"]) < CACHE_TTL
+        _specs_cache["rows"] is not None
+        and _specs_cache["region"] == region_code
+        and (now - _specs_cache["ts"]) < CACHE_TTL
     ):
         return
     offered = list_offered_instance_types(region_code)
     if not offered:
         raise RuntimeError(f"No EC2 instance type offerings in {region_code}")
     specs = describe_instance_specs(region_code, offered)
-    _pricing_cache["rows"] = specs
-    _pricing_cache["region"] = region_code
-    _pricing_cache["ts"] = now
+    _specs_cache["rows"] = specs
+    _specs_cache["region"] = region_code
+    _specs_cache["ts"] = now
 
 def _eligible_specs(req_cpu: int, req_ram_gb: float) -> List[Dict[str, Any]]:
-    # (fixed earlier typo)
     rows = [
-        r
-        for r in _pricing_cache["rows"]
+        r for r in _specs_cache["rows"]
         if r["vCPU"] >= req_cpu and r["memory_GB"] >= req_ram_gb
     ]
     rows.sort(key=lambda r: (r["vCPU"], r["memory_GB"]))
@@ -135,10 +131,24 @@ def _region_offer_url(region: str) -> str:
     rel = r.json()["regions"][region]["currentVersionUrl"]
     return f"{OFFER_BASE}{rel}"
 
+def _is_boxusage_dimension(desc: str) -> bool:
+    """True only for On-Demand instance-hours (not hosts, not add-ons)."""
+    if not desc:
+        return False
+    d = desc.lower()
+    allow = ("on demand", "boxusage", "instance-hour", "instance hours", "instance-hours")
+    deny  = ("dedicated host", "per host", "host reservation", "reserved instance",
+             "upfront", "prepay", "cpu credits", "ebs", "io", "provisioned iops")
+    if not any(k in d for k in allow):
+        return False
+    if any(k in d for k in deny):
+        return False
+    return True
+
 def _build_price_map_public(region: str) -> Dict[str, float]:
     """
     Build {instanceType: price_per_hour} for On-Demand Linux, Shared tenancy.
-    This is tolerant to minor schema/attribute variations.
+    Filters strictly to BoxUsage (instance-hour) dimensions and ignores $0 add-ons.
     """
     url = _region_offer_url(region)
     r = requests.get(url, timeout=180)
@@ -166,24 +176,32 @@ def _build_price_map_public(region: str) -> Dict[str, float]:
         if not itype:
             continue
 
-        # Cheapest $/Hr across dimensions for this SKU
+        # Cheapest BoxUsage $/Hr across dimensions for this SKU
         best = None
         for term in (terms_all.get(sku) or {}).values():
             for dim in (term.get("priceDimensions") or {}).values():
-                if not isinstance(dim, dict) or dim.get("unit") != "Hrs":
+                if not isinstance(dim, dict):
+                    continue
+                if dim.get("unit") != "Hrs":
+                    continue
+                if not _is_boxusage_dimension(dim.get("description") or ""):
                     continue
                 usd = (dim.get("pricePerUnit") or {}).get("USD")
                 if not usd:
                     continue
                 try:
                     v = float(usd)
-                    best = v if (best is None or v < best) else best
                 except Exception:
-                    pass
+                    continue
+                if v <= 0:
+                    # ignore $0 dimensions like CPU credits, metadata, etc.
+                    continue
+                best = v if (best is None or v < best) else best
 
         if best is None:
             continue
 
+        # Keep minimum across SKUs mapping to same instanceType
         if (itype not in prices) or (best < prices[itype]):
             prices[itype] = best
 
@@ -206,9 +224,11 @@ def _build_price_map_public(region: str) -> Dict[str, float]:
                         continue
                     try:
                         v = float(usd)
-                        best = v if (best is None or v < best) else best
                     except Exception:
-                        pass
+                        continue
+                    if v <= 0:
+                        continue
+                    best = v if (best is None or v < best) else best
             if best is not None and ((itype not in prices) or (best < prices[itype])):
                 prices[itype] = best
 
@@ -265,10 +285,10 @@ def prices_for_types(instance_types: List[str], region: str) -> List[Dict[str, A
 def warm_rec_cache():
     print("Warming EC2 offerings/specs cache...")
     offered = list_offered_instance_types(TARGET_REGION_CODE)
-    _pricing_cache["rows"] = describe_instance_specs(TARGET_REGION_CODE, offered)
-    _pricing_cache["region"] = TARGET_REGION_CODE
-    _pricing_cache["ts"] = time.time()
-    print("Cache warm complete. Types cached:", len(_pricing_cache["rows"]))
+    _specs_cache["rows"] = describe_instance_specs(TARGET_REGION_CODE, offered)
+    _specs_cache["region"] = TARGET_REGION_CODE
+    _specs_cache["ts"] = time.time()
+    print("Cache warm complete. Types cached:", len(_specs_cache["rows"]))
 
     # Ensure a valid price file exists
     try:

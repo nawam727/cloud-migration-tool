@@ -1,0 +1,4 @@
+{
+    "terminal.integrated.copyOnSelection": true,
+    "terminal.integrated.rightClickBehavior": "paste"
+}

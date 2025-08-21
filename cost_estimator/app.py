@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os, time, json, traceback
 from typing import List, Dict, Any, Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.config import Config
@@ -118,7 +119,7 @@ def describe_instance_specs(region_code: str, instance_types: List[str]) -> List
     return out
 
 # =========================
-# Pricing helpers + cache
+# Pricing helpers + cache (PATCHED)
 # =========================
 _price_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}  # {region: {itype: {"price":float|None, "ts":epoch}}}
 
@@ -130,6 +131,13 @@ def _extract_price_from_products(price_list: List[str]) -> Optional[float]:
             product = json.loads(product_json)
         except Exception:
             continue
+
+        # Optional guard: skip clearly unrelated product families
+        attrs = (product.get("product") or {}).get("attributes") or {}
+        pfam = attrs.get("productFamily")
+        if pfam not in ("Compute Instance", "Compute Instance (bare metal)", None):
+            continue
+
         terms = product.get("terms", {}).get("OnDemand", {})
         for sku_obj in terms.values():
             if not isinstance(sku_obj, dict):
@@ -169,10 +177,9 @@ def _best_price_via_filters(cli, filters: List[Dict[str, str]]) -> Optional[floa
 
 def price_instance_type_usd_per_hr(itype: str, region_code: str) -> Optional[float]:
     """
-    Minimal, robust filters + pagination:
-      1) instanceType + operatingSystem + location
-      2) instanceType + operatingSystem + regionCode (fallback)
-      3/4) add capacitystatus=Used if both returned nothing
+    Robust filters + pagination:
+      - Linux, Shared tenancy, capacitystatus=Used, preInstalledSw=NA, licenseModel=No License required
+      - Try human location first, then regionCode
     """
     # cache check
     region_cache = _price_cache.setdefault(region_code, {})
@@ -184,46 +191,47 @@ def price_instance_type_usd_per_hr(itype: str, region_code: str) -> Optional[flo
     cli = pricing_client()
     location = REGION_TO_LOCATION.get(region_code)
 
-    common_min = [
-        {"Type": "TERM_MATCH", "Field": "instanceType", "Value": itype},
-        {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
+    common = [
+        {"Type": "TERM_MATCH", "Field": "instanceType",     "Value": itype},
+        {"Type": "TERM_MATCH", "Field": "operatingSystem",  "Value": "Linux"},
+        {"Type": "TERM_MATCH", "Field": "tenancy",          "Value": "Shared"},
+        {"Type": "TERM_MATCH", "Field": "capacitystatus",   "Value": "Used"},
+        {"Type": "TERM_MATCH", "Field": "preInstalledSw",   "Value": "NA"},
+        {"Type": "TERM_MATCH", "Field": "licenseModel",     "Value": "No License required"},
+        {"Type": "TERM_MATCH", "Field": "productFamily",    "Value": "Compute Instance"},
     ]
 
     price = None
 
     if location:
-        f1 = common_min + [{"Type": "TERM_MATCH", "Field": "location", "Value": location}]
+        f1 = common + [{"Type": "TERM_MATCH", "Field": "location", "Value": location}]
         price = _best_price_via_filters(cli, f1)
 
     if price is None:
-        f2 = common_min + [{"Type": "TERM_MATCH", "Field": "regionCode", "Value": region_code}]
+        f2 = common + [{"Type": "TERM_MATCH", "Field": "regionCode", "Value": region_code}]
         price = _best_price_via_filters(cli, f2)
 
-    if price is None and location:
-        f3 = f1 + [{"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"}]
-        price = _best_price_via_filters(cli, f3)
-
-    if price is None:
-        f4 = f2 + [{"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"}]
-        price = _best_price_via_filters(cli, f4)
-
-    # cache write
     region_cache[itype] = {"price": price, "ts": now}
     return price
 
 def prices_for_types(instance_types: List[str], region_code: str) -> List[Dict[str, Any]]:
-    """[{instance_type, price_per_hour}] for given names (order preserved)."""
-    out: List[Dict[str, Any]] = []
+    """[{instance_type, price_per_hour}] for given names (order preserved), parallelized for speed."""
+    # Deduplicate preserving order
     seen = set()
-    for it in instance_types:
-        if not it or not isinstance(it, str):
-            continue
-        if it in seen:
-            continue
-        seen.add(it)
-        price = price_instance_type_usd_per_hr(it, region_code)
-        out.append({"instance_type": it, "price_per_hour": price})
-    return out
+    ordered = [it for it in instance_types if isinstance(it, str) and not (it in seen or seen.add(it))]
+
+    results: Dict[str, Optional[float]] = {}
+    max_workers = min(16, max(1, len(ordered)))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {ex.submit(price_instance_type_usd_per_hr, it, region_code): it for it in ordered}
+        for fut in as_completed(future_map):
+            it = future_map[fut]
+            try:
+                results[it] = fut.result()
+            except Exception:
+                results[it] = None
+
+    return [{"instance_type": it, "price_per_hour": results.get(it)} for it in ordered]
 
 # =========================
 # Cache for offerings/specs list (used by /debug/eligibles and /optimize)
@@ -277,7 +285,7 @@ def debug_eligibles():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# NEW: price by instance names (POST) — UI uses this to fill the price column
+# Price by instance names (POST) — UI uses this to fill the price column
 @app.route("/price_instances", methods=["POST"])
 def price_instances():
     try:
@@ -377,6 +385,25 @@ def optimize():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": "Unhandled server error", "details": str(e), "type": e.__class__.__name__}), 500
+
+# Optional: one-call endpoint to get eligible specs + prices in a single response
+@app.route("/recommend_with_prices", methods=["GET"])
+def recommend_with_prices():
+    try:
+        req_cpu = int(request.args.get("cpu", "1"))
+        req_ram = float(request.args.get("ram", "1"))
+        region = request.args.get("region", TARGET_REGION_CODE)
+        _ensure_specs_cache(region)
+        rows = _eligible_specs(req_cpu, req_ram)[:max(1, MAX_CANDIDATES)]
+        types = [r["instance_type"] for r in rows]
+        priced = prices_for_types(types, region)
+        price_map = {p["instance_type"]: p["price_per_hour"] for p in priced}
+        for r in rows:
+            r["price_per_hour"] = price_map.get(r["instance_type"])
+        return jsonify({"region": region, "count": len(rows), "rows": rows})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/generate-iac", methods=["POST"])
 def generate_iac():

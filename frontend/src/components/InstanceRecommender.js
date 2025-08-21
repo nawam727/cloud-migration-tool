@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import { motion } from "framer-motion";
 import { Cpu, MemoryStick, DollarSign, Loader2 } from "lucide-react";
 import { recommendInstance, fetchEligibles, priceInstances } from "../services/api";
@@ -29,12 +29,17 @@ function Field({ label, name, value, onChange, min = 0, step = 1, suffix }) {
   );
 }
 
+const HOURS_PER_MONTH = 730;
+const fmtHr = (n) => (n == null || n <= 0 ? "—" : `$${Number(n).toFixed(4)}`);
+const fmtMo = (n) => (n == null || n <= 0 ? "—" : `$${(Number(n) * HOURS_PER_MONTH).toFixed(2)}`);
+
 export default function InstanceRecommenderUI() {
   const [inputs, setInputs] = useState({ cpu_cores: 1, ram_gb: 1 });
   const [instance, setInstance] = useState(null);
   const [eligibles, setEligibles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [sortByPrice, setSortByPrice] = useState(true);
 
   const region = process.env.REACT_APP_TARGET_REGION || "us-east-1";
 
@@ -78,10 +83,14 @@ export default function InstanceRecommenderUI() {
       const priceMap = {};
       for (const r of priceRes.data?.rows ?? []) priceMap[r.instance_type] = r.price_per_hour;
 
-      const merged = rawRows.map((r) => ({
-        ...r,
-        price_per_hour: priceMap[r.instance_type] ?? null,
-      }));
+      const merged = rawRows.map((r) => {
+        const p = priceMap[r.instance_type];
+        return {
+          ...r,
+          // treat 0 or negative as missing, so they go to the bottom & show "—"
+          price_per_hour: p == null || p <= 0 ? null : p,
+        };
+      });
 
       setEligibles(merged);
     } catch (err) {
@@ -91,6 +100,34 @@ export default function InstanceRecommenderUI() {
       setLoading(false);
     }
   };
+
+  // compute cheapest (non-null) for highlight
+  const minPrice = useMemo(() => {
+    const vals = eligibles.map((r) => r.price_per_hour).filter((v) => v != null && v > 0);
+    return vals.length ? Math.min(...vals) : null;
+  }, [eligibles]);
+
+  // optional sorting by price (nulls last), then by vCPU/memory
+  const displayRows = useMemo(() => {
+    const rows = [...eligibles];
+    if (sortByPrice) {
+      rows.sort((a, b) => {
+        const ap = a.price_per_hour, bp = b.price_per_hour;
+        if (ap == null && bp == null) {
+          // tie-break by resources if both missing
+          if (a.vCPU !== b.vCPU) return a.vCPU - b.vCPU;
+          return a.memory_GB - b.memory_GB;
+        }
+        if (ap == null) return 1;  // nulls last
+        if (bp == null) return -1;
+        if (ap !== bp) return ap - bp;
+        // tie-break
+        if (a.vCPU !== b.vCPU) return a.vCPU - b.vCPU;
+        return a.memory_GB - b.memory_GB;
+      });
+    }
+    return rows;
+  }, [eligibles, sortByPrice]);
 
   return (
     <div className="dark">
@@ -152,7 +189,16 @@ export default function InstanceRecommenderUI() {
                   suffix="GiB"
                 />
 
-                <div className="sm:col-span-2 flex items-center justify-end gap-3 pt-2">
+                <div className="sm:col-span-2 flex items-center justify-between gap-3 pt-2">
+                  <label className="flex items-center gap-2 text-sm text-slate-300">
+                    <input
+                      type="checkbox"
+                      className="accent-indigo-500"
+                      checked={sortByPrice}
+                      onChange={(e) => setSortByPrice(e.target.checked)}
+                    />
+                    Sort by price (cheapest first)
+                  </label>
                   <button
                     type="submit"
                     disabled={loading}
@@ -185,7 +231,7 @@ export default function InstanceRecommenderUI() {
                   <DollarSign className="h-5 w-5 text-green-400" /> Recommendations
                 </h2>
                 <p className="text-slate-400 text-sm mt-1">
-                  Eligible instances with estimated pricing.
+                  Eligible instances with estimated pricing (Linux On-Demand, Shared Tenancy in {region}).
                 </p>
               </div>
 
@@ -193,13 +239,16 @@ export default function InstanceRecommenderUI() {
                 {/* Single recommended instance */}
                 {instance && (
                   <div className="text-lg font-semibold">
-                    Recommended: <span className="text-indigo-400">{instance.instance_type}</span> — $
-                    {Number(instance.price_per_hour).toFixed(4)}/hr
+                    Recommended: <span className="text-indigo-400">{instance.instance_type}</span>
+                    {" — "}
+                    <span className="text-emerald-400">{fmtHr(instance.price_per_hour)}/hr</span>
+                    {" · "}
+                    <span className="text-emerald-400">{fmtMo(instance.price_per_hour)}/mo</span>
                   </div>
                 )}
 
                 {/* Eligible instances table */}
-                {eligibles.length > 0 && (
+                {displayRows.length > 0 && (
                   <div className="overflow-x-auto">
                     <table className="w-full border border-slate-700 text-sm">
                       <thead className="bg-slate-950/80">
@@ -208,24 +257,44 @@ export default function InstanceRecommenderUI() {
                           <th className="p-2 text-right border-b border-slate-700">vCPU</th>
                           <th className="p-2 text-right border-b border-slate-700">Memory (GiB)</th>
                           <th className="p-2 text-right border-b border-slate-700">$/hr</th>
+                          <th className="p-2 text-right border-b border-slate-700">$/mo</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {eligibles.map((row) => (
-                          <tr key={row.instance_type} className="hover:bg-slate-800">
-                            <td className="p-2 border-b border-slate-700">{row.instance_type}</td>
-                            <td className="p-2 text-right border-b border-slate-700">{row.vCPU}</td>
-                            <td className="p-2 text-right border-b border-slate-700">{Number(row.memory_GB).toFixed(3)}</td>
-                            <td className="p-2 text-right border-b border-slate-700">
-                              {row.price_per_hour != null ? Number(row.price_per_hour).toFixed(4) : "—"}
-                            </td>
-                          </tr>
-                        ))}
+                        {displayRows.map((row) => {
+                          const isCheapest = minPrice != null && row.price_per_hour === minPrice;
+                          return (
+                            <tr
+                              key={row.instance_type}
+                              className={`${
+                                isCheapest
+                                  ? "bg-emerald-900/10 ring-1 ring-emerald-500/30"
+                                  : "hover:bg-slate-800"
+                              }`}
+                            >
+                              <td className="p-2 border-b border-slate-700">
+                                {row.instance_type}
+                                {isCheapest && (
+                                  <span className="ml-3 text-emerald-300 text-xs px-2 py-0.5 rounded-full border border-emerald-600/40 bg-emerald-900/20">
+                                    cheapest
+                                  </span>
+                                )}
+                              </td>
+                              <td className="p-2 text-right border-b border-slate-700">{row.vCPU}</td>
+                              <td className="p-2 text-right border-b border-slate-700">
+                                {Number(row.memory_GB).toFixed(3)}
+                              </td>
+                              <td className="p-2 text-right border-b border-slate-700">
+                                {fmtHr(row.price_per_hour)}
+                              </td>
+                              <td className="p-2 text-right border-b border-slate-700">
+                                {fmtMo(row.price_per_hour)}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
-                    <p className="text-xs text-slate-400 mt-2">
-                      Prices are Linux On-Demand, Shared Tenancy in {region}.
-                    </p>
                   </div>
                 )}
               </div>

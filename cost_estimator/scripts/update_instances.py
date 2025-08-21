@@ -252,15 +252,13 @@ def _build_price_map_public(region: str) -> Dict[str, float]:
     return prices
 
 def _ensure_price_file(region: str) -> Dict[str, float]:
-    """
-    Load prices from disk; if missing or empty, build from public offers and write.
-    """
     pf = _price_file(region)
     if pf.exists():
         try:
             data = json.loads(pf.read_text(encoding="utf-8"))
             prices = data.get("prices") or {}
-            if isinstance(prices, dict) and prices:
+            # only reuse if non-empty and no zeros
+            if isinstance(prices, dict) and prices and not _has_zero_entries(prices):
                 return prices
         except Exception:
             pass
@@ -296,6 +294,19 @@ def warm_rec_cache():
         print(f"Price file ready for {TARGET_REGION_CODE}: {len(prices)} entries at {_price_file(TARGET_REGION_CODE)}")
     except Exception as e:
         print("WARN: could not prepare price file:", e)
+
+# put this near the other helpers
+def _has_zero_entries(prices: Dict[str, float]) -> bool:
+    # any 0 or negative value is considered invalid for On-Demand instance-hours
+    for v in prices.values():
+        try:
+            if float(v) <= 0.0:
+                return True
+        except Exception:
+            return True
+    return False
+
+
 
 # =========================
 # Routes

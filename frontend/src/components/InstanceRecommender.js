@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { setEligibles as publishEligibles } from "../store/eligiblesStore";
 import { motion } from "framer-motion";
-import { Cpu, MemoryStick, DollarSign, Loader2 } from "lucide-react";
+import { Cpu, MemoryStick, DollarSign, Loader2, Cloud } from "lucide-react";
 import { recommendInstance, fetchEligibles, priceInstances } from "../services/api";
 
 function Field({ label, name, value, onChange, min = 0, step = 1, suffix }) {
@@ -147,7 +147,8 @@ export default function InstanceRecommenderUI() {
                 <div className="text-lg font-semibold leading-none">Instance Recommender</div>
               </div>
             </div>
-            <div className="text-sm text-slate-400">
+            <div className="text-sm text-slate-400 flex items-center gap-2">
+              <Cloud className="h-4 w-4" />
               Region: <span className="text-slate-200">{region}</span>
             </div>
           </div>

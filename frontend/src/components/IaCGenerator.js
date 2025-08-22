@@ -1,4 +1,3 @@
-// frontend/src/components/IaCGenerator.js
 import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
@@ -55,16 +54,19 @@ export default function IaCGenerator() {
   const createInstance = async (e) => {
     e.preventDefault();
     setError(null);
+    if (!selectedType) {
+      setError("Pick an instance type from the dropdown first.");
+      return;
+    }
     setCreating(true);
     setStack(null);
     try {
-      const payload = {
+      const res = await createAwsInstance({
         region: form.region,
         instance_type: selectedType,
         volume_gb: form.volume_gb,
         tag_name: form.tag_name,
-      };
-      const res = await createAwsInstance(payload);
+      });
       setStack(res.data);
     } catch (err) {
       console.error(err);
@@ -88,7 +90,7 @@ export default function IaCGenerator() {
     setError(null);
     try {
       await destroyProvisionStack({ region: stack.region || form.region, stack_id: stack.stack_id });
-      setStack((s) => s ? { ...s, destroyed: true } : s);
+      setStack((s) => (s ? { ...s, destroyed: true } : s));
     } catch (err) {
       console.error(err);
       setError(err?.response?.data?.error || "Failed to destroy stack.");
@@ -161,7 +163,7 @@ export default function IaCGenerator() {
 
                   <label className="grid gap-1">
                     <span className="text-slate-300 text-sm font-medium flex items-center gap-2">
-                      <ListChecks className="h-4 w-4 text-emerald-400" /> Instance Type (recommended)
+                      <ListChecks className="h-4 w-4 text-emerald-400" /> Recommended Instances
                     </span>
                     <select
                       value={selectedType}
@@ -233,36 +235,17 @@ export default function IaCGenerator() {
             className="lg:col-span-7"
           >
             <div className="rounded-2xl bg-slate-900/80 border border-slate-800 shadow-xl h-full flex flex-col">
-              <div className="p-6 border-b border-slate-800 flex items-center justify-between">
-                <div>
-                  <h2 className="text-xl font-semibold flex items-center gap-2">
-                    <Server className="h-5 w-5 text-emerald-400" /> Provisioning Result
-                  </h2>
-                  <p className="text-slate-400 text-sm mt-1">
-                    We launch into the default VPC if available; otherwise we create a minimal VPC that’s tagged to your stack.
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={refreshStatus}
-                    disabled={!stack?.stack_id}
-                    className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm hover:bg-slate-900 disabled:opacity-50"
-                  >
-                    <RefreshCw className="h-4 w-4" /> Refresh
-                  </button>
-                  <button
-                    type="button"
-                    onClick={destroyStack}
-                    disabled={!stack?.stack_id || destroying}
-                    className="inline-flex items-center gap-2 rounded-xl border border-rose-900 bg-rose-950 px-3 py-2 text-sm hover:bg-rose-900 disabled:opacity-50"
-                  >
-                    {destroying ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                    Destroy Stack
-                  </button>
-                </div>
+              {/* Card header — title + blurb only (moved buttons out) */}
+              <div className="p-6 border-b border-slate-800">
+                <h2 className="text-xl font-semibold flex items-center gap-2">
+                  <Server className="h-5 w-5 text-emerald-400" /> Provisioning Result
+                </h2>
+                <p className="text-slate-400 text-sm mt-1">
+                  We launch into the default VPC if available; otherwise we create a minimal VPC that’s tagged to your stack.
+                </p>
               </div>
 
+              {/* Card body — all details stay inside the same border */}
               <div className="p-6 space-y-4">
                 {!stack && (
                   <div className="text-slate-400 text-sm">
@@ -305,12 +288,34 @@ export default function IaCGenerator() {
                     )}
 
                     {stack.destroyed && (
-                      <div className="rounded-xl border border-emerald-800 bg-emerald-950 text-emerald-200 p-3">
+                      <div className="rounded-2xl border border-emerald-800 bg-emerald-950 text-emerald-200 p-3">
                         Stack destroyed. Instance terminated and associated resources cleaned up.
                       </div>
                     )}
                   </div>
                 )}
+
+                {/* Card footer — primary-style buttons moved below results */}
+                <div className="flex items-center justify-end gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={refreshStatus}
+                    disabled={!stack?.stack_id}
+                    className="inline-flex items-center justify-center rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 font-medium disabled:opacity-60"
+                  >
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    onClick={destroyStack}
+                    disabled={!stack?.stack_id || destroying}
+                    className="inline-flex items-center justify-center rounded-xl bg-rose-600 hover:bg-rose-500 px-4 py-2 font-medium disabled:opacity-60"
+                  >
+                    {destroying ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
+                    Destroy Stack
+                  </button>
+                </div>
               </div>
             </div>
           </motion.section>

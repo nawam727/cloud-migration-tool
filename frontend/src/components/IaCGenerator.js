@@ -60,7 +60,7 @@ export default function IaCGenerator() {
     try {
       const payload = {
         region: form.region,
-        type: selectedType,
+        instance_type: selectedType,
         volume_gb: form.volume_gb,
         tag_name: form.tag_name,
       };

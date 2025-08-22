@@ -351,6 +351,37 @@ def debug_eligibles():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+    
+@rec_bp.route("/optimize", methods=["POST"])
+def optimize():
+    """Return single cheapest eligible instance (Linux On-Demand) using the local price map."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        req_cpu = int(data.get("cpu_cores", 1))
+        req_ram = float(data.get("ram_gb", 1))
+        region = data.get("region", TARGET_REGION_CODE)
+
+        _ensure_specs_cache(region)
+        # shortlist (same MAX_CANDIDATES logic you already use)
+        rows = _eligible_specs(req_cpu, req_ram)[:max(1, MAX_CANDIDATES)]
+        if not rows:
+            return jsonify({"error": "No instances meet the requirements in this region"}), 404
+
+        # price them from the snapshot
+        names = [r["instance_type"] for r in rows]
+        price_list = prices_for_types(names, region)
+        pmap = {p["instance_type"]: p["price_per_hour"] for p in price_list}
+
+        priced = [{**r, "price_per_hour": pmap.get(r["instance_type"])} for r in rows]
+        # pick lowest positive (or lowest non-null if all zeros/None)
+        valid = [r for r in priced if r["price_per_hour"] not in (None, 0)]
+        best = min(valid, key=lambda r: r["price_per_hour"]) if valid else min(
+            priced, key=lambda r: (float("inf") if r["price_per_hour"] in (None, 0) else r["price_per_hour"])
+        )
+        return jsonify(best)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": "Unhandled server error", "details": str(e)}), 500
 
 @rec_bp.route("/recommend_with_prices")
 def recommend_with_prices():

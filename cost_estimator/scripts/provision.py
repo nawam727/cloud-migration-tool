@@ -1,318 +1,412 @@
-# cost_estimator/scripts/provision.py
-import os, time, uuid, traceback
-from typing import Dict, Any, Optional, List
-from flask import Blueprint, request, jsonify
+# cost_estimator/scripts/provision_aws.py
+import os
+import time
+import uuid
+from typing import Dict, Any, Optional
+
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
+from flask import Blueprint, request, jsonify
 
 provision_bp = Blueprint("provision", __name__)
 
 AWS_PROFILE_NAME = os.getenv("AWS_PROFILE") or os.getenv("CLOUD_MIGRATION_AWS_PROFILE")
-DEFAULT_VOLUME_GB = int(os.getenv("DEFAULT_VOLUME_GB", "20"))
+DEFAULT_REGION = os.getenv("TARGET_REGION_CODE", "us-east-1")
 
-def _session(region: str):
+STACK_TAG_KEY = "CloudMigStack"       # used on all created resources
+NAME_TAG_KEY  = "Name"
+
+# in-memory stack registry (also do tag-based discovery on destroy)
+_STACKS: Dict[str, Dict[str, Any]] = {}
+
+def _session():
     if AWS_PROFILE_NAME:
-        return boto3.session.Session(profile_name=AWS_PROFILE_NAME, region_name=region)
-    return boto3.session.Session(region_name=region)
+        return boto3.session.Session(profile_name=AWS_PROFILE_NAME)
+    return boto3.session.Session()
 
-def _clients(region: str):
-    sess = _session(region)
-    cfg = Config(retries={"max_attempts": 10, "mode": "standard"})
-    return (
-        sess.client("ec2", config=cfg),
-        sess.client("ssm", config=cfg)
+def ec2(region: str):
+    return _session().client("ec2", region_name=region, config=Config(
+        retries={"max_attempts": 10, "mode": "standard"}
+    ))
+
+def _tag_spec(resource: str, stack_id: str, name: str):
+    return [{
+        "ResourceType": resource,
+        "Tags": [
+            {"Key": STACK_TAG_KEY, "Value": stack_id},
+            {"Key": NAME_TAG_KEY,  "Value": name},
+        ],
+    }]
+
+def _ignore_duplicate_rule(e: ClientError) -> bool:
+    return e.response.get("Error", {}).get("Code") in ("InvalidPermission.Duplicate",)
+
+def _ignore_not_found(e: ClientError) -> bool:
+    return e.response.get("Error", {}).get("Code") in (
+        "InvalidGroup.NotFound", "InvalidVpcID.NotFound", "InvalidRouteTableID.NotFound",
+        "InvalidSubnetID.NotFound", "InvalidInternetGatewayID.NotFound",
+        "InvalidAssociationID.NotFound", "InvalidInstanceID.NotFound"
     )
 
-def _supported_arch_for_type(ec2, instance_type: str) -> str:
-    """Return 'arm64' if supported (Graviton), else 'x86_64'."""
-    resp = ec2.describe_instance_types(InstanceTypes=[instance_type])
-    it = (resp.get("InstanceTypes") or [{}])[0]
-    archs = (it.get("ProcessorInfo") or {}).get("SupportedArchitectures") or []
-    return "arm64" if "arm64" in archs else "x86_64"
+# ---------------------------
+# Discover / Create networking
+# ---------------------------
+def _find_default_vpc(cli, region: str) -> Optional[str]:
+    resp = cli.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+    vpcs = resp.get("Vpcs", [])
+    return vpcs[0]["VpcId"] if vpcs else None
 
-def _latest_amazon_linux_2023(ssm, arch: str) -> str:
-    name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64" if arch == "arm64" \
-           else "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
-    p = ssm.get_parameter(Name=name)
-    return p["Parameter"]["Value"]
+def _get_default_subnet(cli, vpc_id: str) -> Optional[str]:
+    # any default-for-az subnet within the default VPC
+    resp = cli.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+    for sn in resp.get("Subnets", []):
+        return sn["SubnetId"]  # pick first
+    return None
 
-def _get_or_create_default_vpc_stack(ec2) -> Dict[str, Any]:
-    """Use default VPC if present; otherwise create a minimal VPC stack."""
-    vpcs = ec2.describe_vpcs(Filters=[{"Name":"isDefault","Values":["true"]}]).get("Vpcs", [])
-    if vpcs:
-        vpc_id = vpcs[0]["VpcId"]
-        # pick a default subnet in this VPC
-        subs = ec2.describe_subnets(
-            Filters=[{"Name":"vpc-id","Values":[vpc_id]}, {"Name":"default-for-az","Values":["true"]}]
-        ).get("Subnets", [])
-        subnet_id = subs[0]["SubnetId"] if subs else ec2.describe_subnets(
-            Filters=[{"Name":"vpc-id","Values":[vpc_id]}]
-        )["Subnets"][0]["SubnetId"]
-        return {"vpc_id": vpc_id, "subnet_id": subnet_id, "created_vpc": False, "igw_id": None, "rtb_id": None}
+def _create_min_vpc(cli, stack_id: str, region: str) -> Dict[str, Any]:
+    # VPC
+    v = cli.create_vpc(CidrBlock="10.0.0.0/16", TagSpecifications=_tag_spec("vpc", stack_id, f"mig-vpc-{stack_id[:8]}"))
+    vpc_id = v["Vpc"]["VpcId"]
+    cli.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+    cli.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
 
-    # create minimal VPC (only if truly no default VPC)
-    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]
-    vpc_id = vpc["VpcId"]
-    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
-    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
+    # Subnet
+    sn = cli.create_subnet(
+        VpcId=vpc_id,
+        CidrBlock="10.0.1.0/24",
+        TagSpecifications=_tag_spec("subnet", stack_id, f"mig-subnet-{stack_id[:8]}"),
+    )
+    subnet_id = sn["Subnet"]["SubnetId"]
+    cli.modify_subnet_attribute(SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True})
 
-    # pick first AZ
-    az = ec2.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
-    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.0.1.0/24", AvailabilityZone=az)["Subnet"]["SubnetId"]
+    # IGW
+    igw = cli.create_internet_gateway(TagSpecifications=_tag_spec("internet-gateway", stack_id, f"mig-igw-{stack_id[:8]}"))
+    igw_id = igw["InternetGateway"]["InternetGatewayId"]
+    cli.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
 
-    igw_id = ec2.create_internet_gateway()["InternetGateway"]["InternetGatewayId"]
-    ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    # Route table + default route
+    rt = cli.create_route_table(VpcId=vpc_id, TagSpecifications=_tag_spec("route-table", stack_id, f"mig-rt-{stack_id[:8]}"))
+    rt_id = rt["RouteTable"]["RouteTableId"]
+    try:
+        cli.create_route(RouteTableId=rt_id, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw_id)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "RouteAlreadyExists":
+            raise
+    cli.associate_route_table(RouteTableId=rt_id, SubnetId=subnet_id)
 
-    rtb_id = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
-    ec2.create_route(RouteTableId=rtb_id, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw_id)
-    ec2.associate_route_table(RouteTableId=rtb_id, SubnetId=subnet_id)
+    return {
+        "created_vpc": True,
+        "vpc_id": vpc_id,
+        "subnet_id": subnet_id,
+        "igw_id": igw_id,
+        "route_table_id": rt_id,
+    }
 
-    return {"vpc_id": vpc_id, "subnet_id": subnet_id, "created_vpc": True, "igw_id": igw_id, "rtb_id": rtb_id}
-
-def _create_sg(ec2, vpc_id: str, stack_id: str) -> str:
-    name = f"cmt-sg-{stack_id[:8]}"
-    sg = ec2.create_security_group(GroupName=name, Description="Cloud Migration Tool SG", VpcId=vpc_id)
-    sg_id = sg["GroupId"]
-    # allow SSH/HTTP/HTTPS (IPv4 & IPv6)
-    ec2.authorize_security_group_ingress(
-        GroupId=sg_id,
-        IpPermissions=[
-            {"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"0.0.0.0/0"}],
-             "Ipv6Ranges":[{"CidrIpv6":"::/0"}]},
-            {"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0"}],
-             "Ipv6Ranges":[{"CidrIpv6":"::/0"}]},
-            {"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0"}],
-             "Ipv6Ranges":[{"CidrIpv6":"::/0"}]},
+def _get_or_create_sg(cli, vpc_id: str, stack_id: str) -> Dict[str, Any]:
+    # try find SG by stack tag
+    resp = cli.describe_security_groups(
+        Filters=[
+            {"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]},
+            {"Name": "vpc-id", "Values": [vpc_id]},
         ]
     )
-    ec2.create_tags(Resources=[sg_id], Tags=[{"Key":"cmt:stack","Value":stack_id},{"Key":"Name","Value":name}])
-    return sg_id
+    if resp.get("SecurityGroups"):
+        sg_id = resp["SecurityGroups"][0]["GroupId"]
+        created = False
+    else:
+        sg = cli.create_security_group(
+            GroupName=f"mig-sg-{stack_id[:8]}",
+            Description=f"Mig SG {stack_id}",
+            VpcId=vpc_id,
+            TagSpecifications=_tag_spec("security-group", stack_id, f"mig-sg-{stack_id[:8]}"),
+        )
+        sg_id = sg["GroupId"]
+        created = True
 
-def _tag_resources(ec2, stack_id: str, tag_name: str, ids: List[str]):
+    # egress: allow all
+    try:
+        cli.authorize_security_group_egress(
+            GroupId=sg_id,
+            IpPermissions=[{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+        )
+    except ClientError as e:
+        if not _ignore_duplicate_rule(e):
+            raise
+
+    # ingress: SSH (22)
+    try:
+        cli.authorize_security_group_ingress(
+            GroupId=sg_id,
+            IpPermissions=[{
+                "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+            }],
+        )
+    except ClientError as e:
+        if not _ignore_duplicate_rule(e):
+            raise
+
+    return {"security_group_id": sg_id, "created_sg": created}
+
+# ---------------------------
+# Instance create / status
+# ---------------------------
+def _run_instance(cli, region: str, stack_id: str, instance_type: str, subnet_id: str, sg_id: str,
+                  tag_name: str, volume_gb: int) -> Dict[str, Any]:
+    resp = cli.run_instances(
+        MinCount=1, MaxCount=1,
+        ImageId=_pick_ami(cli, region),
+        InstanceType=instance_type,
+        NetworkInterfaces=[{
+            "AssociatePublicIpAddress": True,
+            "DeviceIndex": 0,
+            "SubnetId": subnet_id,
+            "Groups": [sg_id],
+        }],
+        BlockDeviceMappings=[{
+            "DeviceName": "/dev/xvda",
+            "Ebs": {"VolumeSize": int(volume_gb or 20), "VolumeType": "gp3", "DeleteOnTermination": True},
+        }],
+        TagSpecifications=[
+            *_tag_spec("instance", stack_id, tag_name or f"mig-instance-{stack_id[:8]}"),
+            *_tag_spec("volume",   stack_id, f"mig-vol-{stack_id[:8]}"),
+            *_tag_spec("network-interface", stack_id, f"mig-eni-{stack_id[:8]}"),
+        ]
+    )
+    inst = resp["Instances"][0]
+    inst_id = inst["InstanceId"]
+    cli.get_waiter("instance_running").wait(InstanceIds=[inst_id])
+    time.sleep(1.0)
+    di = cli.describe_instances(InstanceIds=[inst_id])
+    i = di["Reservations"][0]["Instances"][0]
+    return {
+        "id": inst_id,
+        "type": i.get("InstanceType"),
+        "state": i.get("State", {}).get("Name"),
+        "public_ip": i.get("PublicIpAddress"),
+    }
+
+def _pick_ami(cli, region: str) -> str:
+    owners = ["137112412989", "amazon"]  # Amazon
+    for name in ["al2023-ami-*-x86_64", "amzn2-ami-hvm-*-x86_64-gp2"]:
+        resp = cli.describe_images(
+            Owners=owners,
+            Filters=[{"Name": "name", "Values": [name]}, {"Name": "state", "Values": ["available"]}],
+        )
+        imgs = sorted(resp.get("Images", []), key=lambda x: x.get("CreationDate", ""), reverse=True)
+        if imgs:
+            return imgs[0]["ImageId"]
+    r = cli.describe_images(Owners=["amazon"], Filters=[{"Name": "architecture", "Values": ["x86_64"]}], MaxResults=1)
+    return r["Images"][0]["ImageId"]
+
+# ---------------------------
+# Destroy helpers (idempotent)
+# ---------------------------
+def _terminate_instances_by_tag(cli, stack_id: str):
+    resp = cli.describe_instances(Filters=[{"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]}])
+    ids = []
+    for res in resp.get("Reservations", []):
+        for inst in res.get("Instances", []):
+            state = inst.get("State", {}).get("Name")
+            if state not in ("shutting-down", "terminated"):
+                ids.append(inst["InstanceId"])
     if ids:
-        ec2.create_tags(Resources=ids, Tags=[{"Key":"cmt:stack","Value":stack_id},{"Key":"Name","Value":tag_name}])
+        cli.terminate_instances(InstanceIds=ids)
+        try:
+            cli.get_waiter("instance_terminated").wait(InstanceIds=ids)
+        except Exception:
+            pass
 
+def _disassociate_and_delete_rt(cli, rt_id: str):
+    try:
+        info = cli.describe_route_tables(RouteTableIds=[rt_id])["RouteTables"][0]
+    except ClientError as e:
+        if _ignore_not_found(e): return
+        raise
+    for assoc in info.get("Associations", []):
+        if assoc.get("Main"):
+            continue
+        assoc_id = assoc.get("RouteTableAssociationId")
+        if assoc_id:
+            try:
+                cli.disassociate_route_table(AssociationId=assoc_id)
+            except ClientError as e:
+                if not _ignore_not_found(e): raise
+    try:
+        cli.delete_route(RouteTableId=rt_id, DestinationCidrBlock="0.0.0.0/0")
+    except ClientError:
+        pass
+    try:
+        cli.delete_route_table(RouteTableId=rt_id)
+    except ClientError as e:
+        if not _ignore_not_found(e): raise
+
+def _delete_sg(cli, sg_id: str):
+    for _ in range(5):
+        try:
+            cli.delete_security_group(GroupId=sg_id)
+            return
+        except ClientError as e:
+            if _ignore_not_found(e): return
+            if e.response.get("Error", {}).get("Code") == "DependencyViolation":
+                time.sleep(2.0)
+                continue
+            raise
+
+def _detach_delete_igw(cli, vpc_id: str, igw_id: str):
+    try:
+        cli.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    except ClientError as e:
+        if not _ignore_not_found(e): raise
+    try:
+        cli.delete_internet_gateway(InternetGatewayId=igw_id)
+    except ClientError as e:
+        if not _ignore_not_found(e): raise
+
+def _delete_subnet(cli, subnet_id: str):
+    for _ in range(5):
+        try:
+            cli.delete_subnet(SubnetId=subnet_id)
+            return
+        except ClientError as e:
+            if _ignore_not_found(e): return
+            if e.response.get("Error", {}).get("Code") == "DependencyViolation":
+                time.sleep(2.0)
+                continue
+            raise
+
+def _delete_vpc(cli, vpc_id: str):
+    for _ in range(5):
+        try:
+            cli.delete_vpc(VpcId=vpc_id)
+            return
+        except ClientError as e:
+            if _ignore_not_found(e): return
+            if e.response.get("Error", {}).get("Code") == "DependencyViolation":
+                time.sleep(2.0)
+                continue
+            raise
+
+def _discover_network_by_tag(cli, stack_id: str) -> Dict[str, Optional[str]]:
+    out = {"vpc_id": None, "subnet_id": None, "security_group_id": None, "igw_id": None, "route_table_id": None}
+    vpcs = cli.describe_vpcs(Filters=[{"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]}]).get("Vpcs", [])
+    if vpcs: out["vpc_id"] = vpcs[0]["VpcId"]
+    resp = cli.describe_subnets(Filters=[{"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]}])
+    if resp.get("Subnets"): out["subnet_id"] = resp["Subnets"][0]["SubnetId"]
+    resp = cli.describe_security_groups(Filters=[{"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]}])
+    if resp.get("SecurityGroups"): out["security_group_id"] = resp["SecurityGroups"][0]["GroupId"]
+    resp = cli.describe_internet_gateways(Filters=[{"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]}])
+    if resp.get("InternetGateways"): out["igw_id"] = resp["InternetGateways"][0]["InternetGatewayId"]
+    resp = cli.describe_route_tables(Filters=[{"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]}])
+    if resp.get("RouteTables"): out["route_table_id"] = resp["RouteTables"][0]["RouteTableId"]
+    return out
+
+def _destroy_stack(cli, region: str, stack_id: str, network: Dict[str, Any]):
+    _terminate_instances_by_tag(cli, stack_id)
+    if network.get("security_group_id"):
+        _delete_sg(cli, network["security_group_id"])
+    if network.get("created_vpc"):
+        vpc_id = network.get("vpc_id")
+        if network.get("route_table_id"):
+            _disassociate_and_delete_rt(cli, network["route_table_id"])
+        if network.get("igw_id") and vpc_id:
+            _detach_delete_igw(cli, vpc_id, network["igw_id"])
+        if network.get("subnet_id"):
+            _delete_subnet(cli, network["subnet_id"])
+        if vpc_id:
+            _delete_vpc(cli, vpc_id)
+
+# ---------------------------
+# Routes
+# ---------------------------
 @provision_bp.route("/provision/create", methods=["POST"])
 def provision_create():
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-        region = body.get("region") or os.getenv("TARGET_REGION_CODE") or "us-east-1"
-        instance_type = body.get("type") or "t3.micro"
-        volume_gb = int(body.get("volume_gb") or DEFAULT_VOLUME_GB)
-        tag_name = body.get("tag_name") or "cmt-demo"
-
-        ec2, ssm = _clients(region)
-        stack_id = f"cmt-{uuid.uuid4().hex[:8]}"
-
-        # network (default VPC or minimal VPC)
-        net = _get_or_create_default_vpc_stack(ec2)
-        vpc_id, subnet_id = net["vpc_id"], net["subnet_id"]
-        created_vpc = net["created_vpc"]
-
-        # security group for this stack
-        sg_id = _create_sg(ec2, vpc_id, stack_id)
-
-        # image by arch
-        arch = _supported_arch_for_type(ec2, instance_type)
-        ami = _latest_amazon_linux_2023(ssm, arch)
-
-        # run instance
-        run = ec2.run_instances(
-            ImageId=ami,
-            InstanceType=instance_type,
-            MinCount=1, MaxCount=1,
-            SubnetId=subnet_id,
-            SecurityGroupIds=[sg_id],
-            BlockDeviceMappings=[
-                {
-                    "DeviceName": "/dev/xvda",
-                    "Ebs": {"VolumeSize": volume_gb, "VolumeType": "gp3", "DeleteOnTermination": True}
-                }
-            ],
-            TagSpecifications=[{
-                "ResourceType":"instance",
-                "Tags":[{"Key":"cmt:stack","Value":stack_id},{"Key":"Name","Value":tag_name}]
-            }]
-        )
-        inst = run["Instances"][0]
-        instance_id = inst["InstanceId"]
-
-        # Quick describe for IP/state (no long waiter)
-        desc = ec2.describe_instances(InstanceIds=[instance_id])
-        i0 = desc["Reservations"][0]["Instances"][0]
-        state = i0["State"]["Name"]
-        public_ip = i0.get("PublicIpAddress")
-
-        # Tag VPC if we created it (so destroy knows to remove it)
-        to_tag = [id for id in [net.get("rtb_id"), net.get("igw_id"), vpc_id, subnet_id] if id]
-        if created_vpc:
-            _tag_resources(ec2, stack_id, tag_name, to_tag)
-
-        return jsonify({
-            "ok": True,
-            "region": region,
-            "stack_id": stack_id,
-            "instance": {
-                "id": instance_id,
-                "state": state,
-                "public_ip": public_ip,
-                "type": instance_type,
-                "image": ami,
-                "arch": arch,
-            },
-            "network": {
-                "vpc_id": vpc_id,
-                "subnet_id": subnet_id,
-                "security_group_id": sg_id,
-                "created_vpc": created_vpc,
-                "route_table_id": net.get("rtb_id"),
-                "internet_gateway_id": net.get("igw_id"),
-            }
-        })
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-def _terminate_instances_by_stack(ec2, stack_id: str) -> List[str]:
-    ids = []
-    # find instances with our tag
-    resp = ec2.describe_instances(
-        Filters=[{"Name":"tag:cmt:stack","Values":[stack_id]}]
+    body = request.get_json(force=True, silent=True) or {}
+    region = body.get("region") or DEFAULT_REGION
+    itype  = (
+        body.get("type")
+        or body.get("instance_type")
+        or body.get("InstanceType")
+        or request.args.get("type")
+        or request.args.get("instance_type")
     )
-    for r in resp.get("Reservations", []):
-        for i in r.get("Instances", []):
-            ids.append(i["InstanceId"])
-    if ids:
-        ec2.terminate_instances(InstanceIds=ids)
-    return ids
+    vol_gb = int(body.get("volume_gb") or 20)
+    tag    = body.get("tag_name") or "demo-instance"
 
-def _wait_terminated(ec2, instance_ids: List[str], timeout_s: int = 60):
-    if not instance_ids:
-        return
-    started = time.time()
-    while time.time() - started < timeout_s:
-        desc = ec2.describe_instances(InstanceIds=instance_ids)
-        states = []
-        for r in desc.get("Reservations", []):
-            for i in r.get("Instances", []):
-                states.append(i["State"]["Name"])
-        if all(s in ("shutting-down","terminated") for s in states):
-            return
-        time.sleep(3)
+    if not itype or not str(itype).strip():
+        return jsonify({"error": "Missing instance type (field 'type' or 'instance_type')"}), 400
 
-def _delete_sg_by_stack(ec2, stack_id: str):
-    sgs = ec2.describe_security_groups(
-        Filters=[{"Name":"tag:cmt:stack","Values":[stack_id]}]
-    ).get("SecurityGroups", [])
-    for sg in sgs:
-        try:
-            ec2.delete_security_group(GroupId=sg["GroupId"])
-        except Exception:
-            pass
+    cli = ec2(region)
+    stack_id = str(uuid.uuid4())
 
-def _maybe_delete_vpc_stack(ec2, stack_id: str):
-    # if we tagged a VPC with this stack_id, it's ours; tear down its parts
-    vpcs = ec2.describe_vpcs(Filters=[{"Name":"tag:cmt:stack","Values":[stack_id]}]).get("Vpcs", [])
-    for vpc in vpcs:
-        vpc_id = vpc["VpcId"]
-        # subnets
-        subs = ec2.describe_subnets(Filters=[{"Name":"vpc-id","Values":[vpc_id]}]).get("Subnets", [])
-        # route tables (skip the main default one if not tagged)
-        rtbs = ec2.describe_route_tables(Filters=[{"Name":"vpc-id","Values":[vpc_id]}]).get("RouteTables", [])
-        # igw
-        igws = ec2.describe_internet_gateways(
-            Filters=[{"Name":"attachment.vpc-id","Values":[vpc_id]}]).get("InternetGateways", [])
+    # 1) choose networking
+    default_vpc_id = _find_default_vpc(cli, region)
+    if default_vpc_id:
+        subnet_id = _get_default_subnet(cli, default_vpc_id)
+        if not subnet_id:
+            net = _create_min_vpc(cli, stack_id, region)
+        else:
+            net = {"created_vpc": False, "vpc_id": default_vpc_id, "subnet_id": subnet_id,
+                   "igw_id": None, "route_table_id": None}
+    else:
+        net = _create_min_vpc(cli, stack_id, region)
 
-        # disassociate & delete non-main rtb
-        for rtb in rtbs:
-            # delete non-local routes
-            for assoc in rtb.get("Associations", []):
-                if assoc.get("Main"):
-                    continue
-                if assoc.get("RouteTableAssociationId"):
-                    try:
-                        ec2.disassociate_route_table(RouteTableAssociationId=assoc["RouteTableAssociationId"])
-                    except Exception:
-                        pass
-            # delete routes (except local)
-            for route in rtb.get("Routes", []):
-                if route.get("GatewayId") and route["DestinationCidrBlock"] == "0.0.0.0/0":
-                    try:
-                        ec2.delete_route(RouteTableId=rtb["RouteTableId"], DestinationCidrBlock="0.0.0.0/0")
-                    except Exception:
-                        pass
-            # try delete table if tagged to stack
-            tags = {t["Key"]: t["Value"] for t in rtb.get("Tags", [])}
-            if tags.get("cmt:stack") == stack_id:
-                try:
-                    ec2.delete_route_table(RouteTableId=rtb["RouteTableId"])
-                except Exception:
-                    pass
+    # 2) SG
+    sg = _get_or_create_sg(cli, net["vpc_id"], stack_id)
+    net.update(sg)
 
-        # detach & delete igw
-        for igw in igws:
-            igw_id = igw["InternetGatewayId"]
-            try:
-                ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
-            except Exception:
-                pass
-            try:
-                ec2.delete_internet_gateway(InternetGatewayId=igw_id)
-            except Exception:
-                pass
+    # 3) Run instance
+    inst = _run_instance(cli, region, stack_id, itype, net["subnet_id"], net["security_group_id"], tag, vol_gb)
 
-        # delete subnets
-        for s in subs:
-            try:
-                ec2.delete_subnet(SubnetId=s["SubnetId"])
-            except Exception:
-                pass
+    record = {"stack_id": stack_id, "region": region, "instance": inst, "network": net, "ts": int(time.time())}
+    _STACKS[stack_id] = record
+    return jsonify(record)
 
-        # finally delete VPC
-        try:
-            ec2.delete_vpc(VpcId=vpc_id)
-        except Exception:
-            pass
+@provision_bp.route("/provision/status")
+def provision_status():
+    region = request.args.get("region") or DEFAULT_REGION
+    stack_id = request.args.get("stack_id")
+    if not stack_id:
+        return jsonify({"error": "Missing stack_id"}), 400
+
+    record = _STACKS.get(stack_id, {"stack_id": stack_id, "region": region})
+    cli = ec2(region)
+    desc = cli.describe_instances(Filters=[{"Name": f"tag:{STACK_TAG_KEY}", "Values": [stack_id]}])
+    states = []
+    for res in desc.get("Reservations", []):
+        for i in res.get("Instances", []):
+            states.append({"id": i["InstanceId"], "state": i["State"]["Name"], "type": i.get("InstanceType"),
+                           "public_ip": i.get("PublicIpAddress")})
+    record["instances_found"] = states
+    return jsonify(record)
 
 @provision_bp.route("/provision/destroy", methods=["POST"])
 def provision_destroy():
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-        region = body.get("region") or os.getenv("TARGET_REGION_CODE") or "us-east-1"
-        stack_id = body.get("stack_id")
-        if not stack_id:
-            return jsonify({"ok": False, "error": "stack_id required"}), 400
+    body = request.get_json(force=True, silent=True) or {}
+    region = body.get("region") or DEFAULT_REGION
+    stack_id = body.get("stack_id")
+    if not stack_id:
+        return jsonify({"error": "Missing stack_id"}), 400
 
-        ec2, _ = _clients(region)
-        ids = _terminate_instances_by_stack(ec2, stack_id)
-        _wait_terminated(ec2, ids, timeout_s=60)
-        _delete_sg_by_stack(ec2, stack_id)
-        _maybe_delete_vpc_stack(ec2, stack_id)
-        return jsonify({"ok": True, "terminated": ids})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+    cli = ec2(region)
 
-@provision_bp.route("/provision/status", methods=["GET"])
-def provision_status():
-    try:
-        region = request.args.get("region") or os.getenv("TARGET_REGION_CODE") or "us-east-1"
-        stack_id = request.args.get("stack_id")
-        if not stack_id:
-            return jsonify({"ok": False, "error": "stack_id required"}), 400
+    record = _STACKS.get(stack_id)
+    network = (record or {}).get("network") or {}
+    if not network:
+        network = _discover_network_by_tag(cli, stack_id)
 
-        ec2, _ = _clients(region)
-        resp = ec2.describe_instances(Filters=[{"Name":"tag:cmt:stack","Values":[stack_id]}])
-        items = []
-        for r in resp.get("Reservations", []):
-            for i in r.get("Instances", []):
-                items.append({
-                    "id": i["InstanceId"],
-                    "state": i["State"]["Name"],
-                    "type": i.get("InstanceType"),
-                    "public_ip": i.get("PublicIpAddress"),
-                })
-        return jsonify({"ok": True, "stack_id": stack_id, "instances": items})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+    if "created_vpc" not in network or network["created_vpc"] is None:
+        created_vpc = False
+        if network.get("vpc_id"):
+            vpcs = cli.describe_vpcs(VpcIds=[network["vpc_id"]]).get("Vpcs", [])
+            if vpcs:
+                tags = {t["Key"]: t["Value"] for t in vpcs[0].get("Tags", [])}
+                created_vpc = tags.get(STACK_TAG_KEY) == stack_id
+        network["created_vpc"] = created_vpc
+
+    _destroy_stack(cli, region, stack_id, network)
+    if stack_id in _STACKS:
+        del _STACKS[stack_id]
+
+    return jsonify({"ok": True, "stack_id": stack_id, "deleted": network})

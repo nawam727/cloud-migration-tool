@@ -1,4 +1,5 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
+import { setEligibles as publishEligibles } from "../store/eligiblesStore";
 import { motion } from "framer-motion";
 import { Cpu, MemoryStick, DollarSign, Loader2 } from "lucide-react";
 import { recommendInstance, fetchEligibles, priceInstances } from "../services/api";
@@ -51,6 +52,7 @@ export default function InstanceRecommenderUI() {
     setError(null);
     setInstance(null);
     setEligibles([]);
+    publishEligibles([]);
     setLoading(true);
 
     try {
@@ -93,6 +95,7 @@ export default function InstanceRecommenderUI() {
       });
 
       setEligibles(merged);
+      publishEligibles(merged);
     } catch (err) {
       console.error(err);
       setError("Something went wrong. Please try again.");

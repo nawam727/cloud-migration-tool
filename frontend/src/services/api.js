@@ -21,6 +21,9 @@ export const fetchEligibles = (cpu, ram) =>
 export const priceInstances = (instanceTypes) =>
   API.post("/price_instances", { instance_types: instanceTypes });
 
+export const getRecommendedWithPrices = (cpu, ram, region) =>
+  API.get("/recommend_with_prices", { params: { cpu, ram, region } });
+
 // Other endpoints you already use
 export const estimateCost = (payload) => API.post("/predict", payload);
 

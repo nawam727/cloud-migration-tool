@@ -1,10 +1,14 @@
-import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  Server, Cloud, ListChecks, Loader2, AlertCircle, Trash2, PlayCircle, RefreshCw,
+  AlertCircle,
+  Cloud, ListChecks, Loader2,
+  PlayCircle, RefreshCw,
+  Server,
+  Trash2,
 } from "lucide-react";
-import { getEligibles, subscribeEligibles } from "../store/eligiblesStore";
+import { useEffect, useMemo, useState } from "react";
 import { createAwsInstance, destroyProvisionStack, getProvisionStatus } from "../services/api";
+import { getEligibles, subscribeEligibles } from "../store/eligiblesStore";
 
 const HOURS_PER_MONTH = 730;
 const fmtHr = (n) => (n == null || n <= 0 ? "—" : `$${Number(n).toFixed(4)}`);

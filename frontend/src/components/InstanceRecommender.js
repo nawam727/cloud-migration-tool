@@ -1,8 +1,8 @@
-import React, { useState, useMemo, useEffect } from "react";
-import { setEligibles as publishEligibles } from "../store/eligiblesStore";
 import { motion } from "framer-motion";
-import { Cpu, MemoryStick, DollarSign, Loader2, Cloud } from "lucide-react";
-import { recommendInstance, fetchEligibles, priceInstances } from "../services/api";
+import { Cloud, Cpu, DollarSign, Loader2, MemoryStick } from "lucide-react";
+import { useMemo, useState } from "react";
+import { fetchEligibles, priceInstances, recommendInstance } from "../services/api";
+import { setEligibles as publishEligibles } from "../store/eligiblesStore";
 
 function Field({ label, name, value, onChange, min = 0, step = 1, suffix }) {
   return (

@@ -1,7 +1,8 @@
-import React, { useState, useMemo } from "react";
 import { motion } from "framer-motion";
-import { Cpu, MemoryStick, DollarSign, Loader2 } from "lucide-react";
-import { recommendInstance, fetchEligibles, priceInstances } from "../services/api";
+import { Cloud, Cpu, DollarSign, Loader2, MemoryStick } from "lucide-react";
+import { useMemo, useState } from "react";
+import { fetchEligibles, priceInstances, recommendInstance } from "../services/api";
+import { setEligibles as publishEligibles } from "../store/eligiblesStore";
 
 function Field({ label, name, value, onChange, min = 0, step = 1, suffix }) {
   return (
@@ -51,6 +52,7 @@ export default function InstanceRecommenderUI() {
     setError(null);
     setInstance(null);
     setEligibles([]);
+    publishEligibles([]);
     setLoading(true);
 
     try {
@@ -93,6 +95,7 @@ export default function InstanceRecommenderUI() {
       });
 
       setEligibles(merged);
+      publishEligibles(merged);
     } catch (err) {
       console.error(err);
       setError("Something went wrong. Please try again.");
@@ -144,7 +147,8 @@ export default function InstanceRecommenderUI() {
                 <div className="text-lg font-semibold leading-none">Instance Recommender</div>
               </div>
             </div>
-            <div className="text-sm text-slate-400">
+            <div className="text-sm text-slate-400 flex items-center gap-2">
+              <Cloud className="h-4 w-4" />
               Region: <span className="text-slate-200">{region}</span>
             </div>
           </div>

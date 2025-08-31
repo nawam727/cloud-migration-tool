@@ -1,7 +1,6 @@
-// services/api.js
+// frontend/src/services/api.js
 import axios from "axios";
 
-// CRA/Vite: env must be defined at build time; CRA uses REACT_APP_* prefix
 export const API_BASE =
   process.env.REACT_APP_API_BASE || "http://localhost:5000";
 
@@ -10,18 +9,17 @@ export const API = axios.create({
   headers: { "Content-Type": "application/json" },
 });
 
-// Single best pick
 export const recommendInstance = (inputs) => API.post("/optimize", inputs);
-
-// Unpriced eligibles (your current table source)
 export const fetchEligibles = (cpu, ram) =>
   API.get("/debug/eligibles", { params: { cpu, ram } });
-
-// NEW: price by instance names (POST)
 export const priceInstances = (instanceTypes) =>
   API.post("/price_instances", { instance_types: instanceTypes });
-
-// Other endpoints you already use
+export const getRecommendedWithPrices = (cpu, ram, region) =>
+  API.get("/recommend_with_prices", { params: { cpu, ram, region } });
 export const estimateCost = (payload) => API.post("/predict", payload);
 
-export const generateIaC = (data) => axios.post(`${API_BASE}/generate-iac`, data);
+// NEW: simple provisioning
+export const createAwsInstance = (data) => API.post("/provision/create", data);
+export const destroyProvisionStack = (data) => API.post("/provision/destroy", data);
+export const getProvisionStatus = (region, stack_id) =>
+  API.get("/provision/status", { params: { region, stack_id } });

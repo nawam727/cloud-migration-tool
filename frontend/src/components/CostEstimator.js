@@ -90,7 +90,10 @@ export default function CostEstimator() {
                 <div className="text-lg font-semibold leading-none">Cost Estimator</div>
               </div>
             </div>
-            <div className="text-sm text-slate-400">Region: <span className="text-slate-200">{region}</span></div>
+            <div className="text-sm text-slate-400 flex items-center gap-2">
+              <Cloud className="h-4 w-4" />
+              Region: <span className="text-slate-200">{region}</span>
+            </div>
           </div>
         </header>
 
